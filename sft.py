@@ -1,22 +1,28 @@
 from datasets import load_dataset
 import os 
 import math 
+import time 
 import torch 
-from torch.cuda.amp import autocast
 import torch.nn.functional as F
-import torch.utils
 from torch.utils.data import DataLoader
 from model import Args, load_model_and_tokenizer
 from torch.utils.tensorboard import SummaryWriter
 from transformers import DataCollatorForLanguageModeling
 import wandb
 
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 args = Args(
     model_name="Qwen/Qwen2.5-Coder-0.5B",
     context_length=16384, 
-    batch_size=1 
+    batch_size=1, 
+    use_compile=False,
+    gradient_accumulation_steps=64
 )
 half_num_cpu = os.cpu_count() // 2
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+assert device == 'cuda', 'GPU is required.'
 
 wandb.init(
     project='qwen-sft', 
@@ -28,6 +34,7 @@ wandb.init(
 writer = SummaryWriter()
 
 model, tokenizer = load_model_and_tokenizer(args.model_name)
+model.gradient_checkpointing_enable()
 
 ds = load_dataset("qihoo360/Light-R1-SFTData")
 
@@ -71,57 +78,96 @@ def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
         lr = min_lr
     return lr
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-using_cuda = device == 'cuda'
-optimizer = torch.optim.AdamW(model.parameters(), fused=using_cuda)
-dtype = torch.bfloat16 if using_cuda else torch.float32
+optimizer = torch.optim.AdamW(model.parameters(), fused=True)
 
+dataloader_len = len(dataloader)
+
+# 4 / 64 * 79000
 # lr scheduler config
-max_decay_step = len(dataloader) * args.num_epochs 
-warm_up_step = int(0.2 * max_decay_step)
+total_steps = math.ceil(args.num_epochs * dataloader_len / args.gradient_accumulation_steps)
+max_decay_step = total_steps 
+warm_up_step = int(0.1 * max_decay_step)
 
 torch.set_float32_matmul_precision('high')
 
-if using_cuda:
+if args.use_compile:
     model = torch.compile(model)
 
 model.train()
 
+global_step = 0
+idx = 0
+accum_loss = 0 
+
+os.makedirs('checkpoints', exist_ok=True)
+
 for epoch in range(args.num_epochs):
-    for batch_idx, batch in enumerate(dataloader):  
-        step = epoch * len(dataloader) + batch_idx
-        
-        lr = lr_scheduler(
-            step=step,
-            warm_up_step=warm_up_step,
-            max_decay_step=max_decay_step,
-            max_lr=args.max_lr,
-            min_lr=0.1*args.max_lr
-        )
+    # Gradients accumulation 
+    optimizer.zero_grad() 
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    start = time.time()
+    batch_tokens = 0
 
-        X = batch["input_ids"].to(device)
-        mask = batch["attention_mask"].to(device)
-        y = batch["labels"].to(device)
+    for _, mini_batch in enumerate(dataloader):   
+        X = mini_batch["input_ids"].to(device)
+        mask = mini_batch["attention_mask"].to(device)
+        y = mini_batch["labels"].to(device)
 
         B, T = X.shape
+        batch_tokens += B * T 
 
-        with autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
             y_preds = model(X, attention_mask=mask).logits
             loss = F.cross_entropy(y_preds.view(B * T, -1), y.view(-1))
-        
-        optimizer.zero_grad()
-        loss.backward() 
-        
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        optimizer.step()
+        accum_loss += loss.item()
+        loss /= args.gradient_accumulation_steps
+        loss.backward()  
 
-        writer.add_scalar('Loss/train', loss.item(), step)
-        writer.add_scalar('Chart/norm', norm.item(), step)
-        writer.add_scalar('Chart/lr', lr, step)
+        idx += 1
+        
+        is_update = (idx + 1) % args.gradient_accumulation_steps == 0
+        is_last = idx == dataloader_len - 1
+
+        if is_update or is_last: 
+            global_step += 1
+            lr = lr_scheduler(
+                step=global_step,
+                warm_up_step=warm_up_step,
+                max_decay_step=max_decay_step,
+                max_lr=args.max_lr,
+                min_lr=0.1*args.max_lr
+            )
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+                
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            torch.cuda.synchronize()
+            end = time.time()
+            if is_update:
+                accum_loss /= args.gradient_accumulation_steps
+            else:
+                accum_loss /= idx % args.gradient_accumulation_steps + 1
+
+            tok_per_sec = batch_tokens / (end - start)
+
+            writer.add_scalar('Loss/train', accum_loss, global_step)
+            writer.add_scalar('Charts/norm', norm.item(), global_step)
+            writer.add_scalar('Charts/lr', lr, global_step)
+            writer.add_scalar('Performance/time_per_batch', end - start, global_step)
+            writer.add_scalar('Performance/token_per_sec', tok_per_sec, global_step)
+
+            accum_loss = 0
+            batch_tokens = 0
+            start = time.time()
+        
+        if global_step > 0 and global_step % args.ckpt_step == 0 or global_step == total_steps: 
+            torch.save(model.state_dict(), f'checkpoints/Qwen-step-{global_step}.pt')
     
 writer.close()
 wandb.finish()
