@@ -5,11 +5,14 @@ import time
 import torch 
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from model import Args, load_model_and_tokenizer
 from torch.utils.tensorboard import SummaryWriter
 from transformers import DataCollatorForLanguageModeling
 import wandb
 
+from eval import get_aime_dataset, evaluate_result
+from model import Args, load_model_and_tokenizer
+
+# Mitigate memory fragmentation 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 args = Args(
@@ -17,8 +20,18 @@ args = Args(
     context_length=16384, 
     batch_size=1, 
     use_compile=False,
-    gradient_accumulation_steps=64
+    gradient_accumulation_steps=64,
+    ckpt_step=250,
+    eval_step=50,
+    k=5,
+    eval_generation_kwargs={
+        'do_sample': True,
+        'temperature': 1.0, 
+        'top_p': 0.95,
+        'max_new_tokens': 4096,
+    }
 )
+
 half_num_cpu = os.cpu_count() // 2
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -39,7 +52,7 @@ model.gradient_checkpointing_enable()
 ds = load_dataset("qihoo360/Light-R1-SFTData")
 
 def format_and_tokenize(conversations, max_length): 
-    dialogue = """<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.<|im_end|>\n"""
+    dialogue = """<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The assistant's final answer should be put within \\boxed{}.<|im_end|>\n"""
     for message in conversations: 
         if message['from'] == 'user':
             dialogue += f"<|im_start|>user\n{message['value']}<|im_end|>\n"
@@ -69,6 +82,9 @@ dataloader = DataLoader(
     collate_fn=data_collator
 )
 
+aime_ds = get_aime_dataset(tokenizer, 'AIME_2024')
+aime_dataloader = DataLoader(aime_ds, batch_size=1, shuffle=False)
+
 def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
     if step < warm_up_step: 
         lr = max_lr * (step + 1) / warm_up_step
@@ -82,7 +98,6 @@ optimizer = torch.optim.AdamW(model.parameters(), fused=True)
 
 dataloader_len = len(dataloader)
 
-# 4 / 64 * 79000
 # lr scheduler config
 total_steps = math.ceil(args.num_epochs * dataloader_len / args.gradient_accumulation_steps)
 max_decay_step = total_steps 
@@ -168,6 +183,17 @@ for epoch in range(args.num_epochs):
         
         if global_step > 0 and global_step % args.ckpt_step == 0 or global_step == total_steps: 
             torch.save(model.state_dict(), f'checkpoints/Qwen-step-{global_step}.pt')
+
+        if global_step > 0 and global_step % args.eval_step == 0 or global_step == total_steps:
+            aime_res = evaluate_result(model=model, 
+                                       tokenizer=tokenizer, 
+                                       dataloader=aime_dataloader, 
+                                       k=args.k, 
+                                       device=device, 
+                                       generation_kwargs=args.eval_generation_kwargs
+            )
+            writer.add_scalar('Evaluation/AIME24_pass@k', aime_res['pass@k'], global_step)
+            writer.add_scalar('Evaluation/AIME24_cons@k', aime_res['cons_k'], global_step)
     
 writer.close()
 wandb.finish()
