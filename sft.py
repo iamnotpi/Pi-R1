@@ -83,7 +83,15 @@ dataloader = DataLoader(
 )
 
 aime_ds = get_aime_dataset(tokenizer, 'AIME_2024')
-aime_dataloader = DataLoader(aime_ds, batch_size=1, shuffle=False)
+
+aime_dataloader = DataLoader(
+    aime_ds, 
+    batch_size=1, 
+    shuffle=False,
+    num_workers=half_num_cpu,
+    pin_memory=True,
+    collate_fn=data_collator   
+)
 
 def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
     if step < warm_up_step: 

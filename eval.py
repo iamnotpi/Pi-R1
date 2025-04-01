@@ -1,6 +1,7 @@
 from datasets import load_dataset
 import regex as re 
 import torch 
+from typing import Optional
 
 
 def format_aime(question, tokenizer): 
@@ -38,22 +39,25 @@ def extract_answer(output):
     return None
 
 @torch.no_grad()
-def evaluate_result(model, tokenizer, dataloader, k, device, generation_kwargs):
+def evaluate_result(model, tokenizer, dataloader, k, device, generation_kwargs, stop_token_str: Optional[str] = '<|im_end|>', skip_special_tokens: bool = True):
     num_pass_k = 0 
     num_pass_cons = 0
 
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    stop_id = tokenizer.convert_tokens_to_ids(stop_token_str)
+
     for question in dataloader:
-        input_ids = torch.tensor(question['input_ids']).unsqueeze(0).to(device)
-        attention_mask = torch.tensor(question['attention_mask']).unsqueeze(0).to(device)
+        input_ids = torch.tensor(question['input_ids'], device=device).unsqueeze(0)
+        attention_mask = torch.tensor(question['attention_mask'], device=device).unsqueeze(0)
         ground_truth = question['ground_truth_answer']
 
         model_answers = []
         passed = False
 
         for _ in range(k): 
-            model_output_token = model.generate(input_ids, attention_mask=attention_mask, **generation_kwargs)
+            model_output_token = model.generate(input_ids, attention_mask=attention_mask, use_cache=True, pad_token_id=pad_id, eos_token_id=stop_id, **generation_kwargs)
             input_length = input_ids.shape[1]
-            model_output = tokenizer.decode(model_output_token[0, input_length:])
+            model_output = tokenizer.decode(model_output_token[0, input_length:], skip_special_tokens=skip_special_tokens)
             model_answer = extract_answer(model_output)
             if model_answer is None: 
                 continue
