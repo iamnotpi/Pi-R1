@@ -93,7 +93,7 @@ model.train()
 ds = load_dataset("qihoo360/Light-R1-SFTData")
 
 SFT_dataset = ds.map(
-    lambda x: format_and_tokenize(x["conversations"], max_length=args.context_length),
+    lambda x: format_and_tokenize(x["conversations"], tokenizer, max_length=args.context_length),
     remove_columns=['conversations'],
     num_proc=half_num_cpu
 )
