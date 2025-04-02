@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding 
 import wandb
 
 from eval import get_aime_dataset, evaluate_result
@@ -14,6 +14,42 @@ from model import Args, load_model_and_tokenizer
 
 # Mitigate memory fragmentation 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+def format_and_tokenize(conversations, tokenizer, max_length): 
+    dialogue = """<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The assistant's final answer should be put within \\boxed{}.<|im_end|>\n"""
+    for message in conversations: 
+        if message['from'] == 'user':
+            dialogue += f"<|im_start|>user\n{message['value']}<|im_end|>\n"
+        elif message['from'] == 'assistant':
+            answer = message['value']
+            if "<think>" in answer and "</think>" in answer: 
+                think_end = answer.index("</think>") + len("</think>")
+                answer = answer[:think_end] + "\n<answer>" + answer[think_end:].strip() + "</answer>"
+                dialogue += f"<|im_start|>assistant\n{answer}<|im_end|>\n"
+    return tokenizer(dialogue, truncation=True, padding=False, max_length=max_length)
+
+def custom_collate_fn_wrapper(batch, default_collator: DataCollatorWithPadding):
+    numerical_features = []
+    ground_truth_answers = []
+    for item in batch:
+        numerical_item = {
+            'input_ids': item['input_ids'],
+            'attention_mask': item['attention_mask']
+        }
+        numerical_features.append(numerical_item)
+        ground_truth_answers.append(item['ground_truth_answer'])
+    padded_batch = default_collator(numerical_features)
+    padded_batch['ground_truth_answer'] = ground_truth_answers
+    return padded_batch
+
+def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
+    if step < warm_up_step: 
+        lr = max_lr * (step + 1) / warm_up_step
+    elif step < max_decay_step:
+        lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi / 2 * (step - warm_up_step) / (max_decay_step - warm_up_step)))
+    else:
+        lr = min_lr
+    return lr
 
 args = Args(
     model_name="Qwen/Qwen2.5-Coder-0.5B",
@@ -49,28 +85,22 @@ writer = SummaryWriter()
 model, tokenizer = load_model_and_tokenizer(args.model_name)
 model.gradient_checkpointing_enable()
 
-ds = load_dataset("qihoo360/Light-R1-SFTData")
+if args.use_compile:
+    model = torch.compile(model)
 
-def format_and_tokenize(conversations, max_length): 
-    dialogue = """<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The assistant's final answer should be put within \\boxed{}.<|im_end|>\n"""
-    for message in conversations: 
-        if message['from'] == 'user':
-            dialogue += f"<|im_start|>user\n{message['value']}<|im_end|>\n"
-        elif message['from'] == 'assistant':
-            answer = message['value']
-            if "<think>" in answer and "</think>" in answer: 
-                think_end = answer.index("</think>") + len("</think>")
-                answer = answer[:think_end] + "\n<answer>" + answer[think_end:].strip() + "</answer>"
-                dialogue += f"<|im_start|>assistant\n{answer}<|im_end|>\n"
-    return tokenizer(dialogue, truncation=True, padding=False, max_length=max_length)
+model.train()
+
+ds = load_dataset("qihoo360/Light-R1-SFTData")
 
 SFT_dataset = ds.map(
     lambda x: format_and_tokenize(x["conversations"], max_length=args.context_length),
     remove_columns=['conversations'],
     num_proc=half_num_cpu
 )
+aime_ds = get_aime_dataset(tokenizer, 'AIME_2024')
 
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+inf_data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
 
 dataloader = DataLoader(
     SFT_dataset['train'], 
@@ -81,26 +111,14 @@ dataloader = DataLoader(
     persistent_workers=True,
     collate_fn=data_collator
 )
-
-aime_ds = get_aime_dataset(tokenizer, 'AIME_2024')
-
 aime_dataloader = DataLoader(
     aime_ds, 
     batch_size=1, 
     shuffle=False,
     num_workers=half_num_cpu,
     pin_memory=True,
-    collate_fn=data_collator   
+    collate_fn=lambda batch: custom_collate_fn_wrapper(batch, default_collator=inf_data_collator)  
 )
-
-def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
-    if step < warm_up_step: 
-        lr = max_lr * (step + 1) / warm_up_step
-    elif step < max_decay_step:
-        lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi / 2 * (step - warm_up_step) / (max_decay_step - warm_up_step)))
-    else:
-        lr = min_lr
-    return lr
 
 optimizer = torch.optim.AdamW(model.parameters(), fused=True)
 
@@ -112,11 +130,6 @@ max_decay_step = total_steps
 warm_up_step = int(0.1 * max_decay_step)
 
 torch.set_float32_matmul_precision('high')
-
-if args.use_compile:
-    model = torch.compile(model)
-
-model.train()
 
 global_step = 0
 idx = 0
