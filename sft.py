@@ -10,7 +10,7 @@ from transformers import DataCollatorForLanguageModeling, DataCollatorWithPaddin
 import wandb
 
 from eval import get_aime_dataset, evaluate_result
-from model import Args, load_model_and_tokenizer
+from model import Args, load_model_and_tokenizer, lr_scheduler
 
 # Mitigate memory fragmentation 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -42,17 +42,8 @@ def custom_collate_fn_wrapper(batch, default_collator: DataCollatorWithPadding):
     padded_batch['ground_truth_answer'] = ground_truth_answers
     return padded_batch
 
-def lr_scheduler(step, warm_up_step, max_decay_step, max_lr, min_lr):
-    if step < warm_up_step: 
-        lr = max_lr * (step + 1) / warm_up_step
-    elif step < max_decay_step:
-        lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi / 2 * (step - warm_up_step) / (max_decay_step - warm_up_step)))
-    else:
-        lr = min_lr
-    return lr
-
 args = Args(
-    model_name="Qwen/Qwen2.5-Coder-0.5B",
+    model_name="Qwen/Qwen2.5-Coder-1.5B",
     context_length=16384, 
     batch_size=1, 
     use_compile=False,
