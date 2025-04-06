@@ -1,4 +1,3 @@
-from datasets import load_dataset
 import os 
 import math 
 import time 
@@ -9,24 +8,12 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding 
 import wandb
 
-from eval import get_aime_dataset, evaluate_result
+from data import load_light_r1_sft_dataset, load_aime_dataset
+from eval import evaluate_result
 from model import Args, load_model_and_tokenizer, lr_scheduler
 
 # Mitigate memory fragmentation 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-
-def format_and_tokenize(conversations, tokenizer, max_length): 
-    dialogue = """<|im_start|>system\nA conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The assistant's final answer should be put within \\boxed{}.<|im_end|>\n"""
-    for message in conversations: 
-        if message['from'] == 'user':
-            dialogue += f"<|im_start|>user\n{message['value']}<|im_end|>\n"
-        elif message['from'] == 'assistant':
-            answer = message['value']
-            if "<think>" in answer and "</think>" in answer: 
-                think_end = answer.index("</think>") + len("</think>")
-                answer = answer[:think_end] + "\n<answer>" + answer[think_end:].strip() + "</answer>"
-                dialogue += f"<|im_start|>assistant\n{answer}<|im_end|>\n"
-    return tokenizer(dialogue, truncation=True, padding=False, max_length=max_length)
 
 def custom_collate_fn_wrapper(batch, default_collator: DataCollatorWithPadding):
     numerical_features = []
@@ -81,20 +68,14 @@ if args.use_compile:
 
 model.train()
 
-ds = load_dataset("qihoo360/Light-R1-SFTData")
-
-SFT_dataset = ds.map(
-    lambda x: format_and_tokenize(x["conversations"], tokenizer, max_length=args.context_length),
-    remove_columns=['conversations'],
-    num_proc=half_num_cpu
-)
-aime_ds = get_aime_dataset(tokenizer, 'AIME_2024')
+SFT_dataset = load_light_r1_sft_dataset(tokenizer, context_length=args.context_length, num_proc=half_num_cpu)
+aime_dataset = load_aime_dataset(tokenizer, 'AIME_2024')
 
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 inf_data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding='longest')
 
 dataloader = DataLoader(
-    SFT_dataset['train'], 
+    SFT_dataset, 
     batch_size=args.batch_size, 
     shuffle=True, 
     num_workers=half_num_cpu,
@@ -103,7 +84,7 @@ dataloader = DataLoader(
     collate_fn=data_collator
 )
 aime_dataloader = DataLoader(
-    aime_ds, 
+    aime_dataset, 
     batch_size=1, 
     shuffle=False,
     num_workers=half_num_cpu,
