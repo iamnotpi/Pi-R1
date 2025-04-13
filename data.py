@@ -92,7 +92,7 @@ def load_dapo_dataset(tokenizer):
         return {
             'input_ids': tokenized_prompt['input_ids'],
             'attention_mask': tokenized_prompt['attention_mask'],
-            'ground_truth': float(ground_truth_text)
+            'ground_truth': ground_truth_text
         }
 
     formatted_dataset = dapo_ds.map(

@@ -17,12 +17,16 @@ class Args:
     context_length: int = 32768
     num_epochs: int = 4 
     num_groups: int = 4 # GRPO thing
+    num_updates: int = 32 
+    mini_batch_size: None
     max_lr: float = 2.5e-4
     gradient_accumulation_steps: int = 16 
     use_compile: bool = False
     ckpt_step: int = 1000 
     eval_step: int = 100 
     k: int = 5 # pass@k 
+    low_eps: float = 0.2
+    high_eps: float = 0.28
     eval_generation_kwargs: dict = field(default_factory=lambda: {
         'do_sample': True,
         'temperature': 1.0,
