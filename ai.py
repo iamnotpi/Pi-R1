@@ -2,18 +2,19 @@ from dataclasses import field
 import torch
 from torch.utils.data import DataLoader
 from torch.distributions.categorical import Categorical
-from torch.utils.tensorboard import SummaryWriter
 from transformers import DataCollatorWithPadding
 from typing import List 
 import os
 import wandb
 import numpy as np 
+from tqdm import tqdm 
 
 from data import load_dapo_dataset
 from model import Args, load_model_and_tokenizer 
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 half_num_cpu = os.cpu_count() // 2
+# torch._functorch.config.activation_memory_budget = 0.25
 
 class GRPOArgs(Args): 
     model_name: str = "Qwen/Qwen2.5-Coder-0.5B" 
@@ -21,7 +22,7 @@ class GRPOArgs(Args):
     grpo_epochs: int = 4         # Number of training epochs on collected data
     mini_batch_size: int = 8    # Number of sequences per training mini-batch
     max_prompt_length: int = 512
-    max_generation_length: int = 512
+    max_generation_length: int = 4096
     gradient_accumulation_steps: int = 4 
     lr: float = 1e-6            # Learning rate for RL
     clip_eps: float = 0.2       # PPO/GRPO clipping epsilon
@@ -38,7 +39,7 @@ class GRPOArgs(Args):
 
 args = GRPOArgs()
 
-def compute_reward(answers: List[str], ground_truths_or_prompts: List[str]) -> List[float]:
+def compute_reward(answers: List[str], ground_truths_or_prompts: List[torch.tensor]) -> List[float]:
     pass 
 
 
@@ -59,13 +60,12 @@ wandb.init(
     project='qwen-rl', 
     name=f'sft-run-{args.model_name}',
     config=args,
-    sync_tensorboard=True
 )
-
-writer = SummaryWriter()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model, tokenizer = load_model_and_tokenizer(args.model_name) 
+# model = torch.compile(model)
+model.gradient_checkpointing_enable()
 
 pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 tokenizer.pad_token_id = pad_token_id
@@ -100,6 +100,7 @@ for iter_num in range(args.max_iter):
         'prompt_lens': []
     }
     prompts_processed_in_rollout = 0
+    pbar = tqdm(total=args.num_rollout_steps, desc=f"Rollout Iter {iter_num+1}", leave=False)
     while prompts_processed_in_rollout < args.num_rollout_steps:
         try:
             batch_question = next(data_iter)
@@ -113,9 +114,11 @@ for iter_num in range(args.max_iter):
         if input_ids.shape[1] > args.max_prompt_length:
             continue
 
-        current_prompt_batch_size = input_ids.size(0) 
+        current_prompt_batch_size = input_ids.size(0) # 1
         prompts_processed_in_rollout += current_prompt_batch_size
         global_step += current_prompt_batch_size
+
+        model.config.use_cache = True
 
         # Generate responses
         with torch.no_grad():
@@ -123,13 +126,15 @@ for iter_num in range(args.max_iter):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 num_return_sequences=args.num_groups,
-                output_scores=True, # Needed for log probs
+                output_scores=True, 
                 return_dict_in_generate=True,
                 max_new_tokens=args.max_generation_length,
                 pad_token_id=pad_token_id, 
                 eos_token_id=tokenizer.eos_token_id, 
                 **args.eval_generation_kwargs
             )
+
+        model.config.use_cache = True
 
         sequences = outputs.sequences # (G, full_len), includes prompt + generated + padding
         scores = torch.stack(outputs.scores, dim=1) # (G, gen_len, vocab_size)
@@ -141,9 +146,9 @@ for iter_num in range(args.max_iter):
         dist = Categorical(logits=scores)
         action_log_probs = dist.log_prob(gen_part) # (G, gen_len)
 
-        # Create mask for generated part (excluding padding)
+        # Mask out padding log_probs
         gen_mask = (gen_part != pad_token_id).long() # (G, gen_len)
-        action_log_probs = action_log_probs * gen_mask # Mask out padding log_probs
+        action_log_probs = action_log_probs * gen_mask 
 
         # Compute rewards 
         decoded_outputs = tokenizer.batch_decode(gen_part, skip_special_tokens=True) 
@@ -153,12 +158,13 @@ for iter_num in range(args.max_iter):
         rollout_buffer['prompt_mask'].append(attention_mask.cpu())
         rollout_buffer['full_input_ids'].append(sequences.cpu()) 
         rollout_buffer['full_attention_mask'].append((sequences != pad_token_id).long().cpu())
-        # Pad action_log_probs to max_generation_length before storing if lengths vary significantly across batches
-        # (generate usually pads sequences, so scores/log_probs should align if max_new_tokens is fixed)
         rollout_buffer['log_probs_old'].append(action_log_probs.cpu())
         rollout_buffer['rewards_raw'].extend(current_rewards) # Append rewards for this group
         rollout_buffer['prompt_lens'].extend([actual_prompt_len] * args.num_groups)
 
+        pbar.update(current_prompt_batch_size)
+
+    pbar.close()
     # --- Collate and Process Rollout Data ---
 
     max_len_in_batch = max(seq.shape[1] for seq in rollout_buffer['full_input_ids'])
@@ -198,12 +204,12 @@ for iter_num in range(args.max_iter):
     # Calculate advantages
     all_advantages_raw = calculate_grpo_advantages_outcome(all_rewards_raw, args.num_groups)
 
+    avg_raw_rewards = np.mean(all_rewards_raw)
+    wandb.log({'rollout/avg_raw_reward': avg_raw_rewards}, step=global_step)
+
     num_sequences_rollout = all_full_ids.size(0)
     max_gen_len_rollout = all_log_probs_old_padded.size(1) # Use the actual max gen len from padded log_probs
     advantages_padded = all_advantages_raw.unsqueeze(1).repeat(1, max_gen_len_rollout).cpu()
-
-    # Training 
-    model.train() 
 
     indices = np.arange(num_sequences_rollout) 
 
@@ -215,9 +221,11 @@ for iter_num in range(args.max_iter):
 
         # Mini-batch loop
         for i in range(0, num_sequences_rollout, args.mini_batch_size):
+            model.train()
+
             batch_indices = indices[i : i + args.mini_batch_size]
 
-            # Get mini-batch data (sequences and corresponding rollout data)
+            # Get mini-batch data 
             mb_full_ids = all_full_ids[batch_indices].to(device)
             mb_full_mask = all_full_mask[batch_indices].to(device)
             mb_log_probs_old_padded = all_log_probs_old_padded[batch_indices].to(device)
@@ -225,7 +233,6 @@ for iter_num in range(args.max_iter):
             mb_prompt_lens = all_prompt_lens[batch_indices].to(device)
 
             mb_seq_len = mb_full_ids.shape[1]
-            # Create range tensor [0, 1, ..., seq_len-1]
             position_ids = torch.arange(mb_seq_len, device=device).unsqueeze(0).expand_as(mb_full_ids)
             # Mask is 1 if position >= prompt_len AND original mask is 1
             mb_gen_mask = (position_ids >= mb_prompt_lens.unsqueeze(1)) & (mb_full_mask > 0)
@@ -243,7 +250,6 @@ for iter_num in range(args.max_iter):
                 logits = outputs.logits
                 valid_gen_logits = logits.view(-1, logits.size(-1))[mb_gen_mask.view(-1)] # (num_valid_tokens, vocab_size)
 
-                # Calculate new log probs
                 dist = Categorical(logits=valid_gen_logits)
                 mb_log_probs_new = dist.log_prob(mb_actions)
 
@@ -280,8 +286,11 @@ for iter_num in range(args.max_iter):
         avg_epoch_loss = epoch_total_loss / num_update_steps_epoch
         avg_epoch_pg_loss = epoch_policy_loss / num_update_steps_epoch
         print(f"  Avg Epoch Loss: {avg_epoch_loss:.4f} | Avg Policy Loss: {avg_epoch_pg_loss:.4f}")
-        writer.add_scalar("train/epoch_loss", avg_epoch_loss, iter_num * args.grpo_epochs + epoch)
-        writer.add_scalar("train/epoch_policy_loss", avg_epoch_pg_loss, iter_num * args.grpo_epochs + epoch)
+        wandb.log({
+            "train/epoch_loss": avg_epoch_loss,
+            "train/epoch_policy_loss": avg_epoch_pg_loss,
+            "epoch": iter_num * args.grpo_epochs + epoch 
+        }, step=global_step)
 
     if (iter_num + 1) % args.ckpt_step == 0:
         save_dir = f"checkpoints/grpo_{args.model_name.split('/')[-1]}_iter_{iter_num+1}"
@@ -289,8 +298,8 @@ for iter_num in range(args.max_iter):
         tokenizer.save_pretrained(save_dir)
         print(f"Checkpoint saved to {save_dir}")
 
-    # Add evaluation step if needed
+    # Evaluation
     # if (iter_num + 1) % args.eval_step == 0:
+    #     model.eval()
 
-writer.close()
 wandb.finish()
