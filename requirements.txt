@@ -3,6 +3,7 @@ datasets
 flash-attn
 math-verify
 torch==2.6.0
-transformers==4.51.3
+transformers
 trl
+vllm==0.8.5
 wandb 

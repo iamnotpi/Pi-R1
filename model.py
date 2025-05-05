@@ -1,7 +1,5 @@
 from dataclasses import dataclass, field
 import torch
-from torch.distributions.categorical import Categorical
-import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import math 
 
