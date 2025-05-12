@@ -2,6 +2,8 @@ from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
 from math_verify import ExprExtractionConfig, LatexExtractionConfig, parse, verify
 from latex2sympy2_extended import NormalizationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 import re
 
 dataset = load_dataset("open-r1/DAPO-Math-17k-Processed", "en", split='train')
@@ -129,9 +131,9 @@ training_args = GRPOConfig(
     gradient_accumulation_steps=4,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.85,
-    vllm_max_model_len=8192+512,
-    max_prompt_length=1024,
-    max_completion_length=8192,
+    vllm_max_model_len=4096+512,
+    max_prompt_length=512,
+    max_completion_length=4096,
     learning_rate=1e-6,
     epsilon=0.2,
     epsilon_high=0.28,
@@ -139,7 +141,7 @@ training_args = GRPOConfig(
     # loss_type="dr_grpo",
     beta=0.0,
     # mask_truncated_completions=True,
-    num_generations=8,
+    num_generations=6,
     bf16=True,
     tf32=True,
     gradient_checkpointing=True,
@@ -155,10 +157,19 @@ training_args = GRPOConfig(
     warmup_ratio=0.1
 )
 
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-1.7B",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2"
+)
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+
 trainer = GRPOTrainer(
-    model="Qwen/Qwen3-1.7B",
+    model=model,
     reward_funcs=accuracy_reward,
     args=training_args,
+    processing_class=tokenizer,
     train_dataset=dataset,
 )
 
