@@ -128,13 +128,13 @@ dataset = dataset.map(format_R1)
 
 training_args = GRPOConfig(
     output_dir="Qwen3-1.7B-GRPO", 
-    per_device_train_batch_size=6,
+    per_device_train_batch_size=8,
     gradient_accumulation_steps=6,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.85,
-    vllm_max_model_len=4096+512,
+    vllm_max_model_len=4096+1568,
     max_prompt_length=512,
-    max_completion_length=4096,
+    max_completion_length=4096+1024,
     learning_rate=1e-6,
     epsilon=0.2,
     epsilon_high=0.28,
@@ -145,29 +145,32 @@ training_args = GRPOConfig(
     num_generations=6,
     bf16=True,
     tf32=True,
-    # gradient_checkpointing=True,
-    # gradient_checkpointing_kwargs={'use_reentrant': False},
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={'use_reentrant': False},
     torch_compile=True,
     num_train_epochs=1,
     log_level="info",
     logging_first_step=True,
     logging_steps=1,
-    save_steps=10,
+    save_steps=5,
     report_to="wandb",
     push_to_hub=True,
     hub_model_id="Pi-1905/Qwen3-1.7B-DAPO",
+    hub_strategy="all_checkpoints",
     # lr_scheduler_type='cosine_with_min_lr',
     # lr_scheduler_kwargs={'min_lr': 1e-6},
     warmup_ratio=0.1
 )
 
+model_name = "Qwen/Qwen3-1.7B"
+
 model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen3-1.7B",
+    model_name,
     torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2"
 )
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 trainer = GRPOTrainer(
     model=model,
@@ -177,4 +180,4 @@ trainer = GRPOTrainer(
     train_dataset=dataset,
 )
 
-trainer.train()
+trainer.train(resume_from_checkpoint="Pi-1905/Qwen3-1.7B-DAPO")
