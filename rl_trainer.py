@@ -124,13 +124,14 @@ def format_R1(example):
 dataset = dataset.map(format_R1)
 
 training_args = GRPOConfig(
-    output_dir="Qwen3-0.6B-GRPO", 
+    output_dir="Qwen3-1.7B-GRPO", 
     per_device_train_batch_size=8,
     gradient_accumulation_steps=4,
     use_vllm=True,
-    vllm_gpu_memory_utilization=0.8,
-    vllm_max_model_len=4096+1024,
-    max_completion_length=4096,
+    vllm_gpu_memory_utilization=0.85,
+    vllm_max_model_len=8192+512,
+    max_prompt_length=1024,
+    max_completion_length=8192,
     learning_rate=1e-6,
     epsilon=0.2,
     epsilon_high=0.28,
@@ -149,14 +150,13 @@ training_args = GRPOConfig(
     logging_steps=10,
     save_steps=100,
     report_to="wandb",
-    max_prompt_length=1024,
     # lr_scheduler_type='cosine_with_min_lr',
     # lr_scheduler_kwargs={'min_lr': 1e-6},
     warmup_ratio=0.1
 )
 
 trainer = GRPOTrainer(
-    model="Qwen/Qwen3-0.6B",
+    model="Qwen/Qwen3-1.7B",
     reward_funcs=accuracy_reward,
     args=training_args,
     train_dataset=dataset,
