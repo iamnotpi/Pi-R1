@@ -3,11 +3,8 @@ datasets
 math-verify
 wheel
 packaging
-torch
-torchaudio
-torchvision
 transformers
-deepspeeds
+deepspeed
 trl
-vllm
+huggingface-hub
 wandb 

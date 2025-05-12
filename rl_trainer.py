@@ -6,6 +6,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import re
 
+from huggingface_hub import login
+login(token="your_personal_access_token")
+
 dataset = load_dataset("open-r1/DAPO-Math-17k-Processed", "en", split='train')
 
 system_prompt = "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. The assistant MUST use English only."
@@ -109,7 +112,6 @@ def accuracy_reward(completions, solution, **kwargs):
             except Exception as e:
                 reward = 0.0
         else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
             reward = 1.0
             print("Failed to parse gold solution: ", sol)
         rewards.append(reward)
@@ -126,8 +128,8 @@ dataset = dataset.map(format_R1)
 
 training_args = GRPOConfig(
     output_dir="Qwen3-1.7B-GRPO", 
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=6,
+    gradient_accumulation_steps=6,
     use_vllm=True,
     vllm_gpu_memory_utilization=0.85,
     vllm_max_model_len=4096+512,
@@ -143,15 +145,17 @@ training_args = GRPOConfig(
     num_generations=6,
     bf16=True,
     tf32=True,
-    gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={'use_reentrant': False},
+    # gradient_checkpointing=True,
+    # gradient_checkpointing_kwargs={'use_reentrant': False},
     torch_compile=True,
     num_train_epochs=1,
     log_level="info",
     logging_first_step=True,
-    logging_steps=10,
-    save_steps=50,
+    logging_steps=1,
+    save_steps=10,
     report_to="wandb",
+    push_to_hub=True,
+    hub_model_id="Pi-1905/Qwen3-1.7B-DAPO",
     # lr_scheduler_type='cosine_with_min_lr',
     # lr_scheduler_kwargs={'min_lr': 1e-6},
     warmup_ratio=0.1
