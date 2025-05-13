@@ -187,4 +187,4 @@ trainer = GRPOTrainer(
     train_dataset=dataset,
 )
 
-trainer.train(resume_from_checkpoint="Pi-1905/Qwen3-1.7B-DAPO")
+trainer.train()
