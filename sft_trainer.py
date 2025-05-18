@@ -30,7 +30,6 @@ training_args = SFTConfig(
     max_seq_length=32768,
     learning_rate=1e-5,
     num_train_epochs=8,
-    report_to="wandb",
     gradient_checkpointing=True,
     use_liger_kernel=True,
     eos_token='<|im_end|>',
