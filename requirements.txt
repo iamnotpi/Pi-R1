@@ -8,3 +8,4 @@ deepspeed
 trl
 huggingface-hub
 wandb 
+liger-kernel
