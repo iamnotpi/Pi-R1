@@ -1,6 +1,7 @@
 accelerate
 datasets
 math-verify
+flash-attn
 wheel
 packaging
 transformers
